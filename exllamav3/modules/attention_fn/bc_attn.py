@@ -340,6 +340,7 @@ class BCAttn:
             "k_scales": "*fp16:16", "v_scales": "*fp16:16", "h32": "*fp16:16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
+            "kv_base": "i32", "kv_end": "i32", "slot_base": "i32", "slot_stride": "i32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
@@ -758,9 +759,15 @@ def build_bc_attn(module, layer):
     is not supported (caller falls back to the dispatch path)."""
     from ...cache import CacheLayer_quant, CacheLayer_fp16
     from ...cache.qsa import QSAPlanes
+    from ...cache.stream import StreamLayer
 
     m = module
     qsa_idx = getattr(m, "qsa_indexer", None)
+    if isinstance(layer, StreamLayer):
+        # The graph path bakes pool pointers in; a streaming layer's tensors are a bounded
+        # working set, not the pool (a later milestone can capture the chunk loop)
+        _trace_build(m, None, "attn")
+        return None
     if not (
         _module_eligible(m) and
         isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
@@ -786,4 +793,34 @@ def build_bc_attn(module, layer):
         bca = BCAttn(m, layer.k, layer.v,
                      qsa_layer = layer if qsa_idx is not None else None)
     _trace_build(m, bca, "attn")
+    return bca
+
+
+def build_bc_stream(module, layer):
+    """
+    Build a BCAttn over a streaming layer's resident window. While the whole live history fits
+    the window, slot == token page for every page, so the window is a plain page-major pool and
+    the stock graph applies unchanged, given an identity block table (the layer owns that table
+    and the mirror publish). Returns None when unsupported.
+    """
+    from ...cache import CacheLayer_quant
+    from ...cache.stream import StreamLayer
+
+    m = module
+    if not (
+        _module_eligible(m) and
+        isinstance(layer, StreamLayer) and
+        layer._resident_ready and
+        # A QSA indexer keeps its side planes on the cache layer, which a streaming layer does
+        # not carry; sparse steps stay on the eager path
+        getattr(m, "qsa_indexer", None) is None and
+        (not isinstance(layer, CacheLayer_quant) or layer.compand_a == 0.0)
+    ):
+        _trace_build(m, None, "stream")
+        return None
+    if isinstance(layer, CacheLayer_quant):
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+    else:
+        bca = BCAttn(m, layer.k, layer.v)
+    _trace_build(m, bca, "stream")
     return bca
