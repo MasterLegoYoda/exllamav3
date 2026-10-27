@@ -73,14 +73,16 @@ def lfm2_vl_image_to_tensor(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
-def lfm2_vl_resize(pixels: torch.Tensor, size: tuple) -> torch.Tensor:
+def lfm2_vl_resize(pixels: torch.Tensor, size: tuple, resample: int = 3) -> torch.Tensor:
     """
-    Resize a (3, H, W) uint8 tensor to `size` = (height, width) with antialiased bicubic filtering in the
-    uint8 domain, which is what torchvision does for the reference processor's uint8 inputs (resample 3)
+    Resize a (3, H, W) uint8 tensor to `size` = (height, width) with antialiased filtering in the uint8
+    domain, matching torchvision for the reference processor's uint8 inputs: bicubic for resample 3 (LFM2-VL),
+    bilinear for resample 2 (LFM2.5-VL)
     """
     if pixels.shape[-2:] == tuple(size):
         return pixels
-    return F.interpolate(pixels.unsqueeze(0), size = tuple(size), mode = "bicubic", align_corners = False, antialias = True)[0]
+    mode = {2: "bilinear", 3: "bicubic"}[resample]
+    return F.interpolate(pixels.unsqueeze(0), size = tuple(size), mode = mode, align_corners = False, antialias = True)[0]
 
 
 def lfm2_vl_split_tiles(pixels: torch.Tensor, rows: int, cols: int, tile_size: int) -> torch.Tensor:

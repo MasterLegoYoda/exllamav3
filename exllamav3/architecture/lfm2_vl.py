@@ -115,8 +115,10 @@ def read_lfm2_vl_pp_config(config_dict: dict):
     pp.use_thumbnail = read_dict(ip, bool, "use_thumbnail", True)
     pp.do_image_splitting = read_dict(ip, bool, "do_image_splitting", True)
     pp.max_pixels_tolerance = read_dict(ip, float, "max_pixels_tolerance", 2.0)
-    assert read_dict(ip, int, "resample", 3) == 3, \
-        "Expected bicubic resampling (resample 3) in the image processor config"
+    # PIL/torchvision resampling enum: LFM2-VL uses bicubic (3), LFM2.5-VL uses bilinear (2)
+    pp.resample = read_dict(ip, int, "resample", 3)
+    assert pp.resample in (2, 3), \
+        f"Unsupported resampling mode in the image processor config: {pp.resample} (expected 2 or 3)"
     return pp
 
 
@@ -324,11 +326,11 @@ class Lfm2VlVisionModel(Model):
             cols, rows = lfm2_vl_grid_layout(image.size, pp.min_tiles, pp.max_tiles, pp.tile_size)
             split = rows * cols > 1
         if split:
-            grid = lfm2_vl_resize(pixels, (rows * pp.tile_size, cols * pp.tile_size))
+            grid = lfm2_vl_resize(pixels, (rows * pp.tile_size, cols * pp.tile_size), pp.resample)
             tiles = lfm2_vl_split_tiles(grid, rows, cols, pp.tile_size)
-            single = lfm2_vl_resize(pixels, (new_h, new_w)).unsqueeze(0) if pp.use_thumbnail else None
+            single = lfm2_vl_resize(pixels, (new_h, new_w), pp.resample).unsqueeze(0) if pp.use_thumbnail else None
             return tiles, rows, cols, single
-        return None, 1, 1, lfm2_vl_resize(pixels, (new_h, new_w)).unsqueeze(0)
+        return None, 1, 1, lfm2_vl_resize(pixels, (new_h, new_w), pp.resample).unsqueeze(0)
 
 
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:

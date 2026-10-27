@@ -55,6 +55,16 @@ models:
     path: lfm2.5-8b-a1b/exl3/4.10bpw_mul1
     tags: [moe, conv, attention, recurrent, small, mul1]
 
+  lfm2:
+    path: lfm2.5-350m/exl3/6.00bpw
+    tags: [recurrent, conv, attention, small]
+    notes: LFM2.5 short-conv/full-attention hybrid, text decoder reference for KV streaming
+
+  lfm2-vl:
+    path: lfm2.5-vl-450m/exl3/6.00bpw
+    tags: [recurrent, conv, attention, vision, small]
+    notes: LFM2.5-VL (bilinear image resampling) with the same text decoder, for pinned/CPU vision coverage
+
   moe-shared:
     path: trinity-nano-preview/exl3/4.00bpw_mul1
     tags: [moe, shared_experts, attention, small, mul1]

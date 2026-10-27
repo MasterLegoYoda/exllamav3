@@ -509,6 +509,128 @@ def test_qwen35_vision_tower_cpu_end_to_end():
 
 
 # ------------------------------------------------------------------------------------------------
+# Full LFM2.5-VL vision tower on CPU with synthetic weights. Exercises the LFM2.5 preprocessing
+# (bilinear resampling, pixel unshuffle, 2D position interpolation) through the same module graph
+# used by the real vision component.
+# ------------------------------------------------------------------------------------------------
+
+def _lfm2_vl_vision_weights():
+    g = torch.Generator().manual_seed(13)
+    def rnd(*shape, scale = 0.02):
+        return (torch.randn(*shape, generator = g) * scale).half()
+    H, I, PATCH, POS, FACTOR, PROJ, OUT = 128, 256, 8, 4, 2, 64, 32
+    PATCH_DIM = 3 * PATCH * PATCH
+    pre = "model.vision_tower.vision_model"
+    t = {
+        f"{pre}.embeddings.patch_embedding.weight": rnd(H, PATCH_DIM),
+        f"{pre}.embeddings.patch_embedding.bias": rnd(H),
+        f"{pre}.embeddings.position_embedding.weight": rnd(POS * POS, H),
+    }
+    for b in range(2):
+        p = f"{pre}.encoder.layers.{b}"
+        for n in ("layer_norm1", "layer_norm2"):
+            t[f"{p}.{n}.weight"] = torch.ones(H).half()
+            t[f"{p}.{n}.bias"] = torch.zeros(H).half()
+        for n in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            t[f"{p}.self_attn.{n}.weight"] = rnd(H, H)
+            t[f"{p}.self_attn.{n}.bias"] = rnd(H)
+        t[f"{p}.mlp.fc1.weight"] = rnd(I, H)
+        t[f"{p}.mlp.fc1.bias"] = rnd(I)
+        t[f"{p}.mlp.fc2.weight"] = rnd(H, I)
+        t[f"{p}.mlp.fc2.bias"] = rnd(H)
+    t[f"{pre}.post_layernorm.weight"] = torch.ones(H).half()
+    t[f"{pre}.post_layernorm.bias"] = torch.zeros(H).half()
+    t["model.multi_modal_projector.linear_1.weight"] = rnd(PROJ, H * FACTOR * FACTOR)
+    t["model.multi_modal_projector.linear_1.bias"] = rnd(PROJ)
+    t["model.multi_modal_projector.linear_2.weight"] = rnd(OUT, PROJ)
+    t["model.multi_modal_projector.linear_2.bias"] = rnd(OUT)
+    return t
+
+
+def _make_lfm2_vl_vision_model():
+    from types import SimpleNamespace
+    from exllamav3.architecture.lfm2_vl import Lfm2VlVisionModel
+    from exllamav3.model.config import InferParams
+
+    H, NH, I, PATCH, POS, FACTOR, PROJ, OUT = 128, 4, 256, 8, 4, 2, 64, 32
+    v = SimpleNamespace(
+        hidden_size = H,
+        intermediate_size = I,
+        num_hidden_layers = 2,
+        num_attention_heads = NH,
+        patch_size = PATCH,
+        num_patches = POS * POS,
+        layer_norm_eps = 1e-6,
+        hidden_act = "gelu",
+        num_channels = 3,
+    )
+    v.head_dim = H // NH
+    v.patch_dim = 3 * PATCH * PATCH
+    v.pos_grid = POS
+    pp = SimpleNamespace(
+        resample = 2,
+        rescale_factor = 1 / 255,
+        image_mean = [0.5, 0.5, 0.5],
+        image_std = [0.5, 0.5, 0.5],
+        encoder_patch_size = PATCH,
+        downsample_factor = FACTOR,
+        min_image_tokens = 16,
+        max_image_tokens = 64,
+        min_tiles = 1,
+        max_tiles = 1,
+        tile_size = 64,
+        use_thumbnail = False,
+        do_image_splitting = False,
+        max_pixels_tolerance = 2.0,
+    )
+    cfg = SimpleNamespace(
+        vision = v,
+        vision_pp = pp,
+        downsample_factor = FACTOR,
+        projector_hidden_size = PROJ,
+        projector_hidden_act = "gelu_exact",
+        projector_use_layernorm = False,
+        hidden_size = OUT,
+        use_image_special_tokens = False,
+        image_token_id = None,
+        architecture = "Lfm2VlForConditionalGeneration",
+        infer_params = InferParams(),
+        stc = StubSTC(_lfm2_vl_vision_weights()),
+        layer_map = None,
+    )
+    vm = Lfm2VlVisionModel(cfg)
+    vm.fwd_modules = [(m, 0, i) for i, m in enumerate(vm.modules)]
+    return vm
+
+
+@pytest.mark.nogpu
+def test_lfm2_vl_vision_tower_cpu_end_to_end(monkeypatch):
+    from PIL import Image as PILImage
+    import exllamav3.architecture.lfm2_vl as lfm2_vl
+
+    resize_modes = []
+    resize = lfm2_vl.lfm2_vl_resize
+    def record_resize(pixels, size, resample = 3):
+        resize_modes.append(resample)
+        return resize(pixels, size, resample)
+    monkeypatch.setattr(lfm2_vl, "lfm2_vl_resize", record_resize)
+
+    vm = _make_lfm2_vl_vision_model()
+    vm.load("cpu")
+
+    # 32x32 is upscaled to the 64x64 minimum tile grid (8x8 patches), then 2x pixel-unshuffled
+    image = PILImage.new("RGB", (32, 32), (120, 40, 200))
+    mme = vm.get_image_embeddings(None, image)
+
+    assert resize_modes and set(resize_modes) == {2}, f"unexpected resample modes {resize_modes}"
+    assert mme.mm_length == 16, f"unexpected mm_length {mme.mm_length}"
+    assert mme.embeddings.shape == (16, 32)
+    assert torch.isfinite(mme.embeddings).all()
+    assert mme.embeddings.abs().mean() > 0
+    vm.unload()
+
+
+# ------------------------------------------------------------------------------------------------
 # fn_torch_sdpa_fallback_nocache with cu_seqlens: segmented execution must match per-segment
 # dense SDPA; the dense (non-varlen) path must be unchanged
 # ------------------------------------------------------------------------------------------------

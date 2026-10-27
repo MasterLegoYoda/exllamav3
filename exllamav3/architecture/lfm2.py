@@ -39,6 +39,15 @@ class Lfm2Config(Config):
     arch_string = "Lfm2ForCausalLM"
     config_key = None
 
+
+    def has_lm_head(self):
+        # EXL3 heads have no .weight; the trellis tensors identify the quantized projection
+        return any(
+            self.stc.has_tensor(f"lm_head.{suffix}")
+            for suffix in ("weight", "trellis", "qweight", "q_weight")
+        )
+
+
     def __init__(
         self,
         directory: str,
@@ -72,7 +81,18 @@ class Lfm2Config(Config):
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        # LFM2 releases spell this as `tie_embedding`, while converted checkpoints may carry a defaulted
+        # `tie_word_embeddings: false` alongside it. Either key being true means the head is tied.
+        self.tie_word_embeddings = (
+            self.read_cfg(bool, "tie_word_embeddings", False) or
+            self.read_cfg(bool, "tie_embedding", False)
+        )
+        # LFM2.5 checkpoints may omit both keys and simply ship no lm_head. With no head tensor there is
+        # nothing else to load, and the reference ties the head to the input embedding at load time, so
+        # keep that semantic rather than requiring a quantized copy of the embedding. A real head (plain
+        # or EXL3) still wins over the fallback.
+        if not self.tie_word_embeddings and not self.has_lm_head():
+            self.tie_word_embeddings = True
         self.layer_types = read_lfm2_layer_types(self, self.num_hidden_layers)
 
         # RoPE
